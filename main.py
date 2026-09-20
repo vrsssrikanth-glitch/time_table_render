@@ -42,8 +42,8 @@ BI_LABS = [
     {"EP LAB", "NAS LAB"},
 ]
 
-VALID_2_PERIOD_STARTS = {1, 3, 5, 6}  # 1-2, 3-4, 5-6, 6-7
-VALID_3_PERIOD_STARTS = {1, 2, 5}     # 1-3, 5-7
+VALID_2_PERIOD_STARTS = {1, 3, 5, 6}
+VALID_3_PERIOD_STARTS = {1, 2, 5}
 
 WEEKLY_TEST_FACULTY = "WEEKLY_TEST_FACULTY"
 
@@ -209,7 +209,6 @@ if "FACULTY_ID" in teaching_cols_upper:
 if "HOURS" in teaching_cols_upper:
     teaching.rename(columns={teaching_cols_upper["HOURS"]: "Hours"}, inplace=True)
 
-# Lookups
 fac_id_col = next((c for c in faculty.columns if c.lower() == "faculty_id"), None)
 fac_name_col = next((c for c in faculty.columns if c.lower() == "faculty_name"), None)
 
@@ -494,11 +493,37 @@ def create_excel():
 # ==================================================
 @ui.page("/")
 def main_page():
-    ui.label("Timetable Generative System – Department of BS&H - VIEW").classes("text-2xl font-bold")
-    ui.label("☁️ All master data and timetable records are stored in Supabase.").classes("text-sm text-gray-500 mb-4")
+    ui.add_head_html("""
+        <style>
+            .q-page { padding: 12px !important; }
+            .dense-card { padding: 12px !important; }
+            .q-table--dense td, .q-table--dense th { padding: 4px 8px !important; height: auto !important; }
+        </style>
+    """)
+
+    # Compact Header
+    with ui.row().classes("w-full items-center justify-between mb-2"):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("calendar_month", size="32px", color="primary")
+            ui.label("Timetable Generative System – BS&H").classes("text-xl font-bold text-gray-800")
+            ui.badge("Supabase Connected", color="green").classes("ml-2")
+        
+        with ui.row().classes("gap-2"):
+            def refresh_grid():
+                global TT_DATA
+                TT_DATA = load_timetable()
+                refresh_views()
+                ui.notify("Refreshed data from Supabase.", type="info")
+
+            def download_excel():
+                content = create_excel()
+                ui.download(content, "Timetable.xlsx")
+
+            ui.button("Refresh", icon="refresh", on_click=refresh_grid).props("dense outline")
+            ui.button("Export Excel", icon="download", on_click=download_excel).props("dense color=green")
 
     # Grid render helper
-    def render_table_grid(data_df, formatter_fn, is_faculty=False, faculty_id=""):
+    def render_table_grid(data_df, formatter_fn, is_faculty=False, faculty_id="", target_cls=None):
         columns = [{"name": "Day", "label": "Day", "field": "Day", "align": "left"}]
         for p in PERIODS:
             columns.append({"name": f"P{p}", "label": f"P{p}", "field": f"P{p}", "align": "center"})
@@ -523,22 +548,36 @@ def main_page():
                         if row["Day"] == d:
                             row[f"P{p}"] = val
 
-        table = ui.table(columns=columns, rows=rows, row_key="Day").classes("w-full")
+        table = ui.table(columns=columns, rows=rows, row_key="Day").props("dense flat bordered").classes("w-full")
 
-        if is_faculty:
-            # Custom slot highlighting for unavailable slots
-            table.add_slot(
-                "body-cell",
-                r"""
-                <q-td :props="props" :class="props.value === 'UNAVAILABLE' ? 'bg-red-100 text-red-800 font-bold' : ''">
-                    {{ props.value }}
-                </q-td>
-                """,
-            )
+        # Custom cell slot for interaction
+        table.add_slot(
+            "body-cell",
+            r"""
+            <q-td :props="props" 
+                  :class="props.value === 'UNAVAILABLE' ? 'bg-red-100 text-red-800 font-bold' : (props.value ? 'bg-blue-50 hover:bg-blue-100 cursor-pointer' : '')"
+                  @click="props.value && props.value !== 'UNAVAILABLE' && $parent.$emit('cell-click', {day: props.row.Day, col: props.col.name})">
+                <span class="text-xs">{{ props.value }}</span>
+            </q-td>
+            """,
+        )
+
+        def on_cell_click(e):
+            day = e.args.get("day")
+            col = e.args.get("col", "")
+            if col.startswith("P"):
+                p_num = int(col[1:])
+                if target_cls:
+                    del_cls.set_value(target_cls)
+                del_day.set_value(day)
+                del_per.set_value(p_num)
+                ui.notify(f"Selected slot: {day} Period {p_num} for deletion.", type="info")
+
+        table.on("cell-click", on_cell_click)
 
     # UI Refresh Handlers
     def refresh_views():
-        pending_label.set_text(f"📌 Pending load → {pending_load_row(add_cls.value)}")
+        pending_label.set_text(f"Pending load: {pending_load_row(add_cls.value)}")
         update_class_view()
         update_faculty_view()
         update_lab_view()
@@ -557,7 +596,7 @@ def main_page():
         add_sub.set_options(subs)
         if subs:
             add_sub.set_value(subs[0])
-        pending_label.set_text(f"📌 Pending load → {pending_load_row(selected_cls)}")
+        pending_label.set_text(f"Pending load: {pending_load_row(selected_cls)}")
 
     # Add & Delete Action Handlers
     def handle_add():
@@ -595,169 +634,168 @@ def main_page():
             ui.notify("Deleted from Supabase.", type="positive")
             refresh_views()
 
-    # Layout Top Section (Entry Controls)
-    with ui.row().classes("w-full gap-8"):
-        # Add Entry
-        with ui.card().classes("w-1/2 p-4"):
-            ui.label("➕ Add Entry").classes("text-lg font-bold")
+    # Layout Top Section (2-Column Control Section)
+    with ui.row().classes("w-full gap-4 mb-2"):
+        # Column 1: Add Entry
+        with ui.card().classes("w-1/2 dense-card shadow-sm border border-gray-200"):
+            with ui.row().classes("items-center justify-between w-full mb-1"):
+                ui.label("➕ Add Entry").classes("text-md font-bold text-blue-700")
+                sugg_chip = ui.chip("", icon="lightbulb", color="blue-1").props("dense text-color=blue").classes("text-xs")
+                sugg_chip.set_visibility(False)
 
-            add_cls = ui.select(
-                options=CLASSES,
-                label="Class",
-                value=CLASSES[0] if CLASSES else None,
-                on_change=lambda e: update_subjects_dropdown(e.value),
-            ).classes("w-full")
+            with ui.grid(columns=2).classes("w-full gap-2"):
+                add_cls = ui.select(
+                    options=CLASSES,
+                    label="Class",
+                    value=CLASSES[0] if CLASSES else None,
+                    on_change=lambda e: update_subjects_dropdown(e.value),
+                ).props("dense outlined").classes("w-full")
 
-            add_sub = ui.select(options=[], label="Subject").classes("w-full")
-            add_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).classes("w-full")
-            add_start = ui.select(options=PERIODS, label="Start Period", value=PERIODS[0]).classes("w-full")
+                add_sub = ui.select(options=[], label="Subject").props("dense outlined").classes("w-full")
+                add_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
+                add_start = ui.select(options=PERIODS, label="Start Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
 
-            ui.button("ADD", on_click=handle_add).classes("mt-2 bg-blue-600 text-white")
-            sugg_label = ui.label("").classes("text-sm text-blue-600 mt-2")
+            with ui.row().classes("w-full items-center justify-between mt-2"):
+                pending_label = ui.label("Pending load: ...").classes("text-xs text-gray-600 font-semibold")
+                ui.button("ADD ENTRY", icon="add_circle", on_click=handle_add).props("dense color=primary")
 
             def update_suggestions():
                 if add_cls.value and add_sub.value:
                     sugg = suggest_slots(add_cls.value, add_sub.value)
-                    sugg_label.set_text(f"Suggested slots: {', '.join(sugg)}" if sugg else "")
+                    if sugg:
+                        sugg_chip.set_text(f"Slots: {', '.join(sugg)}")
+                        sugg_chip.set_visibility(True)
+                    else:
+                        sugg_chip.set_visibility(False)
 
             add_sub.on_value_change(update_suggestions)
 
-        # Delete Entry
-        with ui.card().classes("w-1/2 p-4"):
-            ui.label("❌ Delete Entry").classes("text-lg font-bold")
-            del_cls = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None).classes("w-full")
-            del_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).classes("w-full")
-            del_per = ui.select(options=PERIODS, label="Period", value=PERIODS[0]).classes("w-full")
+        # Column 2: Delete Entry
+        with ui.card().classes("w-1/2 dense-card shadow-sm border border-gray-200"):
+            ui.label("❌ Delete Entry").classes("text-md font-bold text-red-700 mb-1")
 
-            ui.button("DELETE", on_click=handle_delete).classes("mt-2 bg-red-600 text-white")
+            with ui.grid(columns=2).classes("w-full gap-2"):
+                del_cls = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-full")
+                del_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
+                del_per = ui.select(options=PERIODS, label="Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
+                
+                with ui.column().classes("justify-end h-full"):
+                    ui.button("DELETE ENTRY", icon="delete", on_click=handle_delete).props("dense color=negative").classes("w-full")
 
-    # Pending Load Marker
-    pending_label = ui.label(f"📌 Pending load → {pending_load_row(CLASSES[0] if CLASSES else '')}").classes("text-md font-semibold my-4")
+            ui.label("💡 Tip: Click any scheduled cell in the views below to auto-fill deletion details.").classes("text-xs text-gray-400 mt-2")
 
-    # Layout Bottom Section (Tabs View)
-    with ui.tabs().classes("w-full") as tabs:
-        t1 = ui.tab("📘 Class View")
-        t2 = ui.tab("👨‍🏫 Faculty View")
-        t3 = ui.tab("🧪 Lab View")
-        t4 = ui.tab("🏫 Room View")
+    # Layout Bottom Section (Tabs View - Compact)
+    with ui.card().classes("w-full dense-card shadow-sm border border-gray-200"):
+        with ui.tabs().classes("w-full dense text-primary") as tabs:
+            t1 = ui.tab("📘 Class View")
+            t2 = ui.tab("👨‍🏫 Faculty View")
+            t3 = ui.tab("🧪 Lab View")
+            t4 = ui.tab("🏫 Room View")
 
-    with ui.tab_panels(tabs, value=t1).classes("w-full"):
-        # Class View Panel
-        with ui.tab_panel(t1):
-            cv_select = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None)
-            class_container = ui.element("div").classes("w-full mt-4")
+        with ui.tab_panels(tabs, value=t1).classes("w-full p-2"):
+            # Class View Panel
+            with ui.tab_panel(t1).classes("p-0"):
+                with ui.row().classes("items-center mb-2"):
+                    cv_select = ui.select(options=CLASSES, label="Select Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-64")
+                class_container = ui.element("div").classes("w-full")
 
-            def update_class_view():
-                class_container.clear()
-                df = pd.DataFrame(TT_DATA)
-                cdf = df[df["Class"].astype(str).str.strip().str.upper() == str(cv_select.value).strip().upper()] if "Class" in df.columns and not df.empty else pd.DataFrame()
-                with class_container:
-                    render_table_grid(
-                        cdf,
-                        lambda r: f'{r["Subject"]} | CLASS COORDINATOR' if r["Faculty"] == WEEKLY_TEST_FACULTY else f'{r["Subject"]} | {FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])}',
-                    )
-
-            cv_select.on_value_change(update_class_view)
-
-        # Faculty View Panel
-        with ui.tab_panel(t2):
-            sorted_fac_names = sorted(list(set(str(v) for v in FAC_NAME.values() if v)))
-            fv_select = ui.select(options=sorted_fac_names, label="Faculty", value=sorted_fac_names[0] if sorted_fac_names else None)
-            fac_container = ui.element("div").classes("w-full mt-4")
-
-            def update_faculty_view():
-                fac_container.clear()
-                fname = fv_select.value
-                if fname:
-                    fid = [k for k, v in FAC_NAME.items() if v == fname][0]
+                def update_class_view():
+                    class_container.clear()
                     df = pd.DataFrame(TT_DATA)
-                    fdf = df[df["Faculty"].astype(str).str.upper() == fid.upper()] if "Faculty" in df.columns and not df.empty else pd.DataFrame()
-                    with fac_container:
-                        render_table_grid(fdf, lambda r: r["Class"], is_faculty=True, faculty_id=fid)
-                        ui.label("🔴 Red cells indicate faculty unavailable slots").classes("text-sm text-red-600 mt-2")
-
-            fv_select.on_value_change(update_faculty_view)
-
-        # Lab View Panel
-        with ui.tab_panel(t3):
-            lab_list = sorted(labs_df["Lab_Subject"].dropna().unique()) if "Lab_Subject" in labs_df.columns else []
-            lab_select = ui.select(options=lab_list, label="Lab", value=lab_list[0] if lab_list else None)
-            lab_container = ui.element("div").classes("w-full mt-4")
-
-            def update_lab_view():
-                lab_container.clear()
-                lab = lab_select.value
-                if lab:
-                    related_labs = [
-                        b for pair in BI_LABS
-                        if any(lab.lower() in p.lower() or p.lower() in lab.lower() for p in pair)
-                        for b in pair
-                    ]
-                    all_target_labs = list(set([lab] + related_labs))
-                    df = pd.DataFrame(TT_DATA)
-                    ldf = df[df["Subject"].apply(lambda s: any(t.lower() in str(s).lower() for t in all_target_labs))] if not df.empty and "Subject" in df.columns else pd.DataFrame()
-
-                    with lab_container:
-                        if not ldf.empty:
-                            render_table_grid(
-                                ldf,
-                                lambda r: f'{r["Class"]} | {r["Subject"]} | {FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])}',
-                            )
-                        else:
-                            ui.label("No scheduled classes found for this lab in the current timetable.").classes("text-yellow-600")
-
-            lab_select.on_value_change(update_lab_view)
-
-        # Room View Panel
-        with ui.tab_panel(t4):
-            ui.label("Theory Room Planning").classes("text-lg font-bold")
-            room_radio = ui.radio(CLASSES, value=CLASSES[0] if CLASSES else None).props("inline")
-            room_container = ui.element("div").classes("w-full mt-4")
-
-            def update_room_view():
-                room_container.clear()
-                mirror_cls = room_radio.value
-                df = pd.DataFrame(TT_DATA)
-                mirror = (
-                    df[
-                        (df["Class"].astype(str).str.strip().str.upper() == str(mirror_cls).strip().upper())
-                        & (~df["Subject"].fillna("").astype(str).str.contains("LAB", case=False))
-                        & (~df["Subject"].isin(EXCLUDE_THEORY_ROOM))
-                    ]
-                    if not df.empty and "Class" in df.columns
-                    else pd.DataFrame()
-                )
-
-                with room_container:
-                    if not mirror.empty:
+                    cdf = df[df["Class"].astype(str).str.strip().str.upper() == str(cv_select.value).strip().upper()] if "Class" in df.columns and not df.empty else pd.DataFrame()
+                    with class_container:
                         render_table_grid(
-                            mirror,
-                            lambda r: f'{r["Class"]} | {r["Subject"]} | {FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])}',
+                            cdf,
+                            lambda r: f'{r["Subject"]} ({FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])})',
+                            target_cls=cv_select.value,
                         )
 
-            room_radio.on_value_change(update_room_view)
+                cv_select.on_value_change(update_class_view)
+
+            # Faculty View Panel
+            with ui.tab_panel(t2).classes("p-0"):
+                sorted_fac_names = sorted(list(set(str(v) for v in FAC_NAME.values() if v)))
+                with ui.row().classes("items-center mb-2"):
+                    fv_select = ui.select(options=sorted_fac_names, label="Select Faculty", value=sorted_fac_names[0] if sorted_fac_names else None).props("dense outlined").classes("w-64")
+                fac_container = ui.element("div").classes("w-full")
+
+                def update_faculty_view():
+                    fac_container.clear()
+                    fname = fv_select.value
+                    if fname:
+                        fid = [k for k, v in FAC_NAME.items() if v == fname][0]
+                        df = pd.DataFrame(TT_DATA)
+                        fdf = df[df["Faculty"].astype(str).str.upper() == fid.upper()] if "Faculty" in df.columns and not df.empty else pd.DataFrame()
+                        with fac_container:
+                            render_table_grid(fdf, lambda r: r["Class"], is_faculty=True, faculty_id=fid)
+
+                fv_select.on_value_change(update_faculty_view)
+
+            # Lab View Panel
+            with ui.tab_panel(t3).classes("p-0"):
+                lab_list = sorted(labs_df["Lab_Subject"].dropna().unique()) if "Lab_Subject" in labs_df.columns else []
+                with ui.row().classes("items-center mb-2"):
+                    lab_select = ui.select(options=lab_list, label="Select Lab", value=lab_list[0] if lab_list else None).props("dense outlined").classes("w-64")
+                lab_container = ui.element("div").classes("w-full")
+
+                def update_lab_view():
+                    lab_container.clear()
+                    lab = lab_select.value
+                    if lab:
+                        related_labs = [
+                            b for pair in BI_LABS
+                            if any(lab.lower() in p.lower() or p.lower() in lab.lower() for p in pair)
+                            for b in pair
+                        ]
+                        all_target_labs = list(set([lab] + related_labs))
+                        df = pd.DataFrame(TT_DATA)
+                        ldf = df[df["Subject"].apply(lambda s: any(t.lower() in str(s).lower() for t in all_target_labs))] if not df.empty and "Subject" in df.columns else pd.DataFrame()
+
+                        with lab_container:
+                            if not ldf.empty:
+                                render_table_grid(
+                                    ldf,
+                                    lambda r: f'{r["Class"]} | {r["Subject"]}',
+                                )
+                            else:
+                                ui.label("No scheduled classes found for this lab.").classes("text-xs text-yellow-700")
+
+                lab_select.on_value_change(update_lab_view)
+
+            # Room View Panel
+            with ui.tab_panel(t4).classes("p-0"):
+                with ui.row().classes("items-center mb-2"):
+                    room_radio = ui.radio(CLASSES, value=CLASSES[0] if CLASSES else None).props("inline dense")
+                room_container = ui.element("div").classes("w-full")
+
+                def update_room_view():
+                    room_container.clear()
+                    mirror_cls = room_radio.value
+                    df = pd.DataFrame(TT_DATA)
+                    mirror = (
+                        df[
+                            (df["Class"].astype(str).str.strip().str.upper() == str(mirror_cls).strip().upper())
+                            & (~df["Subject"].fillna("").astype(str).str.contains("LAB", case=False))
+                            & (~df["Subject"].isin(EXCLUDE_THEORY_ROOM))
+                        ]
+                        if not df.empty and "Class" in df.columns
+                        else pd.DataFrame()
+                    )
+
+                    with room_container:
+                        if not mirror.empty:
+                            render_table_grid(
+                                mirror,
+                                lambda r: f'{r["Class"]} | {r["Subject"]}',
+                                target_cls=mirror_cls,
+                            )
+
+                room_radio.on_value_change(update_room_view)
 
     # Initial view load
     if CLASSES:
         update_subjects_dropdown(CLASSES[0])
     refresh_views()
-
-    # Footer Actions
-    ui.separator().classes("my-4")
-    with ui.row():
-        def refresh_grid():
-            global TT_DATA
-            TT_DATA = load_timetable()
-            refresh_views()
-            ui.notify("Refreshed data from Supabase.", type="info")
-
-        ui.button("🔄 Refresh Data from Supabase", on_click=refresh_grid).classes("bg-gray-600 text-white")
-
-        def download_excel():
-            content = create_excel()
-            ui.download(content, "Timetable.xlsx")
-
-        ui.button("📥 Download Excel", on_click=download_excel).classes("bg-green-600 text-white")
 
 
 # ==================================================
@@ -766,4 +804,3 @@ def main_page():
 if __name__ in {"__main__", "__mp_main__"}:
     port = int(os.environ.get("PORT", 8080))
     ui.run(host="0.0.0.0", port=port, title="Timetable Generative System")
-    
