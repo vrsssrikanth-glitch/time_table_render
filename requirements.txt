@@ -1,0 +1,5 @@
+nicegui
+supabase
+pandas
+openpyxl
+gunicorn
