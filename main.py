@@ -1,5 +1,6 @@
 import io
 import os
+import zlib
 import pandas as pd
 from nicegui import app, ui
 from supabase import Client, create_client
@@ -61,12 +62,31 @@ TABLE_TIMETABLE = "timetable"
 
 
 # ==================================================
-# HELPERS
+# HELPERS & COLOR GENERATOR
 # ==================================================
 def clean(x):
     if pd.isna(x):
         return ""
     return str(x).strip()
+
+
+def get_subject_color(subject_name):
+    """Generates a consistent, unique light pastel background color and border color for each subject."""
+    if not subject_name or subject_name == "UNAVAILABLE":
+        return "background-color: #fee2e2; border-left: 4px solid #ef4444;"
+    
+    clean_sub = clean(subject_name).split("\n")[0].split("(")[0].strip().upper()
+    
+    # Generate deterministic hue from subject string CRC32
+    hash_val = zlib.crc32(clean_sub.encode("utf-8"))
+    hue = hash_val % 360
+    
+    # Use standard pastel palette parameters (HSL)
+    bg_color = f"hsla({hue}, 75%, 92%, 0.85)"
+    border_color = f"hsl({hue}, 70%, 40%)"
+    text_color = f"hsl({hue}, 80%, 20%)"
+    
+    return f"background-color: {bg_color}; border-left: 4px solid {border_color}; color: {text_color}; font-weight: 600;"
 
 
 def fetch_table(table_name):
@@ -182,14 +202,14 @@ def subject_duration(sub):
 def is_valid_start_slot(sub, start):
     dur = subject_duration(sub)
     if dur == 2 and start not in VALID_2_PERIOD_STARTS:
-        return False, "2-period subjects must start at Period 1, 3, or 5 (e.g., 1-2, 3-4, 5-6)."
+        return False, "2-period subjects must start at Period 1, 3, or 5."
     if dur == 3 and start not in VALID_3_PERIOD_STARTS:
-        return False, "3-period subjects/labs must start at Period 1 or 5 (e.g., 1-3, 5-7)."
+        return False, "3-period subjects/labs must start at Period 1 or 5."
     return True, ""
 
 
 # ==================================================
-# INITIAL DATA LOADING & PROCESS
+# INITIAL DATA LOADING
 # ==================================================
 faculty, subjects, classes_df, teaching, fac_avail, labs_df, rooms_df = fetch_master_data()
 
@@ -213,12 +233,14 @@ fac_id_col = next((c for c in faculty.columns if c.lower() == "faculty_id"), Non
 fac_name_col = next((c for c in faculty.columns if c.lower() == "faculty_name"), None)
 
 FAC_NAME = {}
+FAC_OPTIONS = {}
 if fac_id_col and fac_name_col:
     for _, r in faculty.iterrows():
         fid = clean(r[fac_id_col]).upper()
         fname = clean(r[fac_name_col])
         if fid and fname:
             FAC_NAME[fid] = fname
+            FAC_OPTIONS[fid] = f"{fname} ({fid})"
 
 SUB_FAC = (
     {
@@ -327,26 +349,29 @@ def get_theory_room(cls, day, start, dur):
     return None
 
 
-def pending_load_row(cls):
+def calculate_class_stats(cls):
     cls_col = next((c for c in teaching.columns if c.lower() == "class_id"), None)
     sub_col = next((c for c in teaching.columns if c.lower() == "subject_id"), None)
     hrs_col = next((c for c in teaching.columns if c.lower() == "hours"), None)
 
     if not cls_col or not sub_col:
-        return "Load data unavailable"
+        return 0, 0, []
 
     cls_mask = teaching[cls_col].astype(str).str.strip().str.upper() == str(cls).strip().upper()
     class_teaching_df = teaching[cls_mask]
-    parts = []
+
+    total_target = 0
+    total_scheduled = 0
+    sub_progress = []
 
     for _, row in class_teaching_df.iterrows():
         s = clean(row[sub_col])
         if not s:
             continue
         try:
-            total = int(row[hrs_col]) if hrs_col and pd.notna(row[hrs_col]) else 0
+            target = int(row[hrs_col]) if hrs_col and pd.notna(row[hrs_col]) else 0
         except (ValueError, TypeError):
-            total = 0
+            target = 0
 
         used = sum(
             1
@@ -355,14 +380,15 @@ def pending_load_row(cls):
             and clean(r.get("Subject")).upper() == clean(s).upper()
         )
 
-        if used < total:
-            parts.append(f"{s}: {used}/{total}")
+        total_target += target
+        total_scheduled += used
+        sub_progress.append({"subject": s, "used": used, "target": target})
 
-    return " | ".join(parts) if parts else "All load completed"
+    return total_scheduled, total_target, sub_progress
 
 
-def suggest_slots(cls, sub):
-    fac = SUB_FAC.get((clean(cls).upper(), clean(sub).upper()))
+def suggest_slots(cls, sub, custom_fac=None):
+    fac = custom_fac or SUB_FAC.get((clean(cls).upper(), clean(sub).upper()))
     dur = subject_duration(sub)
     suggestions = []
 
@@ -375,18 +401,18 @@ def suggest_slots(cls, sub):
                 continue
             if any(busy("Class", cls, d, x) for x in range(p, p + dur)):
                 continue
-            if fac != WEEKLY_TEST_FACULTY and any((fac, d, x) in FAC_BLOCKED for x in range(p, p + dur)):
+            if fac and fac != WEEKLY_TEST_FACULTY and any((fac, d, x) in FAC_BLOCKED for x in range(p, p + dur)):
                 continue
-            suggestions.append(f"{d} P{p}")
-    return suggestions[:3]
+            suggestions.append((d, p))
+    return suggestions[:4]
 
 
-def add_entry(cls, sub, day, start):
+def add_entry(cls, sub, day, start, override_fac=None):
     valid_slot, slot_err = is_valid_start_slot(sub, start)
     if not valid_slot:
         return slot_err
 
-    fac = WEEKLY_TEST_FACULTY if clean(sub).upper() == "WEEKLY TEST" else SUB_FAC.get((clean(cls).upper(), clean(sub).upper()), "NA")
+    fac = override_fac or (WEEKLY_TEST_FACULTY if clean(sub).upper() == "WEEKLY TEST" else SUB_FAC.get((clean(cls).upper(), clean(sub).upper()), "NA"))
     dur = subject_duration(sub)
 
     if start + dur - 1 > 7:
@@ -495,18 +521,19 @@ def create_excel():
 def main_page():
     ui.add_head_html("""
         <style>
-            .q-page { padding: 12px !important; }
-            .dense-card { padding: 12px !important; }
-            .q-table--dense td, .q-table--dense th { padding: 4px 8px !important; height: auto !important; }
+            .q-page { padding: 10px !important; }
+            .dense-card { padding: 10px !important; }
+            .q-table--dense td, .q-table--dense th { padding: 4px 6px !important; height: auto !important; }
+            .sub-cell-badge { border-radius: 4px; padding: 2px 6px; font-size: 11px; display: inline-block; width: 100%; text-align: center; }
         </style>
     """)
 
     # Compact Header
     with ui.row().classes("w-full items-center justify-between mb-2"):
         with ui.row().classes("items-center gap-2"):
-            ui.icon("calendar_month", size="32px", color="primary")
+            ui.icon("dashboard", size="28px", color="primary")
             ui.label("Timetable Generative System – BS&H").classes("text-xl font-bold text-gray-800")
-            ui.badge("Supabase Connected", color="green").classes("ml-2")
+            ui.badge("Supabase Connected", color="green").classes("ml-1")
         
         with ui.row().classes("gap-2"):
             def refresh_grid():
@@ -522,18 +549,21 @@ def main_page():
             ui.button("Refresh", icon="refresh", on_click=refresh_grid).props("dense outline")
             ui.button("Export Excel", icon="download", on_click=download_excel).props("dense color=green")
 
-    # Grid render helper
+    # Grid render helper with color coding
     def render_table_grid(data_df, formatter_fn, is_faculty=False, faculty_id="", target_cls=None):
         columns = [{"name": "Day", "label": "Day", "field": "Day", "align": "left"}]
         for p in PERIODS:
             columns.append({"name": f"P{p}", "label": f"P{p}", "field": f"P{p}", "align": "center"})
 
         rows = []
+        color_styles = {}  # Store cell specific inline styles
+
         for day in DAYS:
             row_dict = {"Day": day}
             for p in PERIODS:
                 if is_faculty and (faculty_id.upper(), day, p) in FAC_BLOCKED:
                     row_dict[f"P{p}"] = "UNAVAILABLE"
+                    color_styles[f"{day}_P{p}"] = get_subject_color("UNAVAILABLE")
                 else:
                     row_dict[f"P{p}"] = ""
             rows.append(row_dict)
@@ -542,25 +572,36 @@ def main_page():
             for _, r in data_df.iterrows():
                 d = r.get("Day")
                 p = int(r.get("Period", 0))
+                sub_name = r.get("Subject", "")
                 if d in DAYS and p in PERIODS:
                     val = formatter_fn(r)
                     for row in rows:
                         if row["Day"] == d:
                             row[f"P{p}"] = val
+                            color_styles[f"{d}_P{p}"] = get_subject_color(sub_name if sub_name else val)
 
         table = ui.table(columns=columns, rows=rows, row_key="Day").props("dense flat bordered").classes("w-full")
 
-        # Custom cell slot for interaction
+        # Dynamic cell slot using color styles
         table.add_slot(
             "body-cell",
             r"""
             <q-td :props="props" 
-                  :class="props.value === 'UNAVAILABLE' ? 'bg-red-100 text-red-800 font-bold' : (props.value ? 'bg-blue-50 hover:bg-blue-100 cursor-pointer' : '')"
+                  :style="props.row[props.col.name + '_style'] || ''"
+                  :class="props.value ? 'hover:opacity-80 cursor-pointer transition-all' : ''"
                   @click="props.value && props.value !== 'UNAVAILABLE' && $parent.$emit('cell-click', {day: props.row.Day, col: props.col.name})">
-                <span class="text-xs">{{ props.value }}</span>
+                <span class="sub-cell-badge">{{ props.value }}</span>
             </q-td>
             """,
         )
+
+        # Inject computed styles into row objects for Vue binding
+        for row in rows:
+            day = row["Day"]
+            for p in PERIODS:
+                col_key = f"P{p}"
+                style_key = f"{day}_{col_key}"
+                row[f"{col_key}_style"] = color_styles.get(style_key, "")
 
         def on_cell_click(e):
             day = e.args.get("day")
@@ -571,13 +612,13 @@ def main_page():
                     del_cls.set_value(target_cls)
                 del_day.set_value(day)
                 del_per.set_value(p_num)
-                ui.notify(f"Selected slot: {day} Period {p_num} for deletion.", type="info")
+                ui.notify(f"Selected {day} P{p_num} for deletion.", type="info")
 
         table.on("cell-click", on_cell_click)
 
     # UI Refresh Handlers
     def refresh_views():
-        pending_label.set_text(f"Pending load: {pending_load_row(add_cls.value)}")
+        update_analytics_panel()
         update_class_view()
         update_faculty_view()
         update_lab_view()
@@ -596,11 +637,54 @@ def main_page():
         add_sub.set_options(subs)
         if subs:
             add_sub.set_value(subs[0])
-        pending_label.set_text(f"Pending load: {pending_load_row(selected_cls)}")
+        update_faculty_override()
+        update_analytics_panel()
+
+    def update_faculty_override():
+        if add_cls.value and add_sub.value:
+            mapped = SUB_FAC.get((clean(add_cls.value).upper(), clean(add_sub.value).upper()))
+            if mapped and mapped in FAC_OPTIONS:
+                add_fac_override.set_value(mapped)
+            else:
+                add_fac_override.set_value(None)
+        update_suggestions()
+
+    # Right side dashboard panel refresh
+    def update_analytics_panel():
+        cls = add_cls.value
+        if not cls:
+            return
+
+        sched, target, sub_progress = calculate_class_stats(cls)
+        progress_val = (sched / target) if target > 0 else 0.0
+
+        analytics_container.clear()
+        with analytics_container:
+            ui.label(f"📊 Class Load Monitor: {cls}").classes("text-md font-bold text-gray-800")
+            
+            with ui.row().classes("w-full items-center justify-between my-1"):
+                ui.label(f"Scheduled: {sched} / {target} hrs").classes("text-xs font-semibold text-gray-600")
+                ui.label(f"{int(progress_val * 100)}% Complete").classes("text-xs font-bold text-blue-600")
+
+            ui.linear_progress(value=progress_val, show_value=False).props("stripe rounded size=10px color=primary")
+
+            ui.label("Subject Breakdown").classes("text-xs font-bold text-gray-500 mt-2 mb-1")
+            with ui.row().classes("w-full gap-1 wrap max-h-36 overflow-y-auto"):
+                for sp in sub_progress:
+                    sub_code = sp["subject"]
+                    used = sp["used"]
+                    tot = sp["target"]
+                    is_complete = used >= tot and tot > 0
+                    
+                    chip_color = "bg-green-100 text-green-800 border-green-300" if is_complete else "bg-amber-50 text-amber-900 border-amber-200"
+                    
+                    with ui.card().classes(f"p-1 border text-xs {chip_color} shadow-2xs"):
+                        ui.label(f"{sub_code}: {used}/{tot}").classes("font-mono text-xs")
 
     # Add & Delete Action Handlers
     def handle_add():
-        err = add_entry(add_cls.value, add_sub.value, add_day.value, int(add_start.value))
+        ov_fac = add_fac_override.value
+        err = add_entry(add_cls.value, add_sub.value, add_day.value, int(add_start.value), override_fac=ov_fac)
         if err:
             ui.notify(err, type="warning")
         else:
@@ -634,57 +718,79 @@ def main_page():
             ui.notify("Deleted from Supabase.", type="positive")
             refresh_views()
 
-    # Layout Top Section (2-Column Control Section)
-    with ui.row().classes("w-full gap-4 mb-2"):
-        # Column 1: Add Entry
-        with ui.card().classes("w-1/2 dense-card shadow-sm border border-gray-200"):
-            with ui.row().classes("items-center justify-between w-full mb-1"):
-                ui.label("➕ Add Entry").classes("text-md font-bold text-blue-700")
-                sugg_chip = ui.chip("", icon="lightbulb", color="blue-1").props("dense text-color=blue").classes("text-xs")
-                sugg_chip.set_visibility(False)
+    # ==================================================
+    # MAIN LAYOUT (2 EQUAL COLUMNS ON TOP)
+    # ==================================================
+    with ui.row().classes("w-full gap-3 mb-2 items-stretch"):
+        # LEFT COLUMN: Add Entry & Delete Entry Stack
+        with ui.column().classes("w-7/12 gap-2"):
+            # Add Entry Form
+            with ui.card().classes("w-full dense-card shadow-sm border border-gray-200"):
+                with ui.row().classes("items-center justify-between w-full mb-1"):
+                    ui.label("➕ Add Entry").classes("text-md font-bold text-blue-700")
+                    sugg_container = ui.row().classes("gap-1 items-center")
 
-            with ui.grid(columns=2).classes("w-full gap-2"):
-                add_cls = ui.select(
-                    options=CLASSES,
-                    label="Class",
-                    value=CLASSES[0] if CLASSES else None,
-                    on_change=lambda e: update_subjects_dropdown(e.value),
-                ).props("dense outlined").classes("w-full")
+                with ui.grid(columns=3).classes("w-full gap-2"):
+                    add_cls = ui.select(
+                        options=CLASSES,
+                        label="Class",
+                        value=CLASSES[0] if CLASSES else None,
+                        on_change=lambda e: update_subjects_dropdown(e.value),
+                    ).props("dense outlined").classes("w-full")
 
-                add_sub = ui.select(options=[], label="Subject").props("dense outlined").classes("w-full")
-                add_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
-                add_start = ui.select(options=PERIODS, label="Start Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
+                    add_sub = ui.select(options=[], label="Subject").props("dense outlined").classes("w-full")
+                    
+                    add_fac_override = ui.select(
+                        options=FAC_OPTIONS,
+                        label="Faculty (Mapped/Override)",
+                        with_input=True,
+                    ).props("dense outlined use-input").classes("w-full")
 
-            with ui.row().classes("w-full items-center justify-between mt-2"):
-                pending_label = ui.label("Pending load: ...").classes("text-xs text-gray-600 font-semibold")
-                ui.button("ADD ENTRY", icon="add_circle", on_click=handle_add).props("dense color=primary")
+                    add_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
+                    add_start = ui.select(options=PERIODS, label="Start Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
 
-            def update_suggestions():
-                if add_cls.value and add_sub.value:
-                    sugg = suggest_slots(add_cls.value, add_sub.value)
-                    if sugg:
-                        sugg_chip.set_text(f"Slots: {', '.join(sugg)}")
-                        sugg_chip.set_visibility(True)
-                    else:
-                        sugg_chip.set_visibility(False)
+                    with ui.column().classes("justify-end h-full"):
+                        ui.button("ADD ENTRY", icon="add_circle", on_click=handle_add).props("dense color=primary").classes("w-full")
 
-            add_sub.on_value_change(update_suggestions)
+                def update_suggestions():
+                    sugg_container.clear()
+                    if add_cls.value and add_sub.value:
+                        sugg = suggest_slots(add_cls.value, add_sub.value, custom_fac=add_fac_override.value)
+                        with sugg_container:
+                            if sugg:
+                                ui.label("Available Slots:").classes("text-xs text-gray-500 font-bold")
+                                for s_day, s_p in sugg:
+                                    def set_slot(d=s_day, p=s_p):
+                                        add_day.set_value(d)
+                                        add_start.set_value(p)
+                                    ui.chip(f"{s_day[:3]} P{s_p}", on_click=set_slot).props("dense clickable color=blue-1 text-color=blue").classes("text-xs cursor-pointer")
+                            else:
+                                ui.label("No free slots").classes("text-xs text-red-400")
 
-        # Column 2: Delete Entry
-        with ui.card().classes("w-1/2 dense-card shadow-sm border border-gray-200"):
-            ui.label("❌ Delete Entry").classes("text-md font-bold text-red-700 mb-1")
+                add_sub.on_value_change(update_faculty_override)
+                add_fac_override.on_value_change(update_suggestions)
 
-            with ui.grid(columns=2).classes("w-full gap-2"):
-                del_cls = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-full")
-                del_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
-                del_per = ui.select(options=PERIODS, label="Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
-                
-                with ui.column().classes("justify-end h-full"):
+            # Delete Entry Form
+            with ui.card().classes("w-full dense-card shadow-sm border border-gray-200"):
+                with ui.row().classes("items-center justify-between w-full mb-1"):
+                    ui.label("❌ Delete Entry").classes("text-md font-bold text-red-700")
+                    ui.label("💡 Tip: Click scheduled grid cells to auto-fill").classes("text-xs text-gray-400")
+
+                with ui.grid(columns=4).classes("w-full gap-2 items-center"):
+                    del_cls = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-full")
+                    del_day = ui.select(options=DAYS, label="Day", value=DAYS[0]).props("dense outlined").classes("w-full")
+                    del_per = ui.select(options=PERIODS, label="Period", value=PERIODS[0]).props("dense outlined").classes("w-full")
+                    
                     ui.button("DELETE ENTRY", icon="delete", on_click=handle_delete).props("dense color=negative").classes("w-full")
 
-            ui.label("💡 Tip: Click any scheduled cell in the views below to auto-fill deletion details.").classes("text-xs text-gray-400 mt-2")
+        # RIGHT COLUMN: Live Class Analytics Dashboard (Utilizing empty right space)
+        with ui.column().classes("w-5/12"):
+            with ui.card().classes("w-full h-full dense-card shadow-sm border border-gray-200 bg-slate-50"):
+                analytics_container = ui.column().classes("w-full")
 
-    # Layout Bottom Section (Tabs View - Compact)
+    # ==================================================
+    # BOTTOM TABS VIEW SECTION
+    # ==================================================
     with ui.card().classes("w-full dense-card shadow-sm border border-gray-200"):
         with ui.tabs().classes("w-full dense text-primary") as tabs:
             t1 = ui.tab("📘 Class View")
@@ -692,11 +798,11 @@ def main_page():
             t3 = ui.tab("🧪 Lab View")
             t4 = ui.tab("🏫 Room View")
 
-        with ui.tab_panels(tabs, value=t1).classes("w-full p-2"):
+        with ui.tab_panels(tabs, value=t1).classes("w-full p-1"):
             # Class View Panel
             with ui.tab_panel(t1).classes("p-0"):
-                with ui.row().classes("items-center mb-2"):
-                    cv_select = ui.select(options=CLASSES, label="Select Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-64")
+                with ui.row().classes("items-center mb-1"):
+                    cv_select = ui.select(options=CLASSES, label="Select Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-56")
                 class_container = ui.element("div").classes("w-full")
 
                 def update_class_view():
@@ -706,36 +812,44 @@ def main_page():
                     with class_container:
                         render_table_grid(
                             cdf,
-                            lambda r: f'{r["Subject"]} ({FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])})',
+                            lambda r: f'{r["Subject"]}\n({FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])})',
                             target_cls=cv_select.value,
                         )
 
                 cv_select.on_value_change(update_class_view)
 
-            # Faculty View Panel
+            # Faculty View Panel (Auto-searchable Faculty Dropdown)
             with ui.tab_panel(t2).classes("p-0"):
-                sorted_fac_names = sorted(list(set(str(v) for v in FAC_NAME.values() if v)))
-                with ui.row().classes("items-center mb-2"):
-                    fv_select = ui.select(options=sorted_fac_names, label="Select Faculty", value=sorted_fac_names[0] if sorted_fac_names else None).props("dense outlined").classes("w-64")
+                fac_name_to_id = {v: k for k, v in FAC_NAME.items()}
+                sorted_fac_names = sorted(list(fac_name_to_id.keys()))
+
+                with ui.row().classes("items-center mb-1"):
+                    fv_select = ui.select(
+                        options=sorted_fac_names,
+                        label="Search & Select Faculty",
+                        value=sorted_fac_names[0] if sorted_fac_names else None,
+                        with_input=True,
+                    ).props("dense outlined use-input").classes("w-72")
+
                 fac_container = ui.element("div").classes("w-full")
 
                 def update_faculty_view():
                     fac_container.clear()
                     fname = fv_select.value
-                    if fname:
-                        fid = [k for k, v in FAC_NAME.items() if v == fname][0]
+                    if fname and fname in fac_name_to_id:
+                        fid = fac_name_to_id[fname]
                         df = pd.DataFrame(TT_DATA)
                         fdf = df[df["Faculty"].astype(str).str.upper() == fid.upper()] if "Faculty" in df.columns and not df.empty else pd.DataFrame()
                         with fac_container:
-                            render_table_grid(fdf, lambda r: r["Class"], is_faculty=True, faculty_id=fid)
+                            render_table_grid(fdf, lambda r: f'{r["Class"]}\n[{r["Subject"]}]', is_faculty=True, faculty_id=fid)
 
                 fv_select.on_value_change(update_faculty_view)
 
             # Lab View Panel
             with ui.tab_panel(t3).classes("p-0"):
                 lab_list = sorted(labs_df["Lab_Subject"].dropna().unique()) if "Lab_Subject" in labs_df.columns else []
-                with ui.row().classes("items-center mb-2"):
-                    lab_select = ui.select(options=lab_list, label="Select Lab", value=lab_list[0] if lab_list else None).props("dense outlined").classes("w-64")
+                with ui.row().classes("items-center mb-1"):
+                    lab_select = ui.select(options=lab_list, label="Select Lab", value=lab_list[0] if lab_list else None).props("dense outlined").classes("w-56")
                 lab_container = ui.element("div").classes("w-full")
 
                 def update_lab_view():
@@ -755,16 +869,16 @@ def main_page():
                             if not ldf.empty:
                                 render_table_grid(
                                     ldf,
-                                    lambda r: f'{r["Class"]} | {r["Subject"]}',
+                                    lambda r: f'{r["Class"]}\n{r["Subject"]}',
                                 )
                             else:
-                                ui.label("No scheduled classes found for this lab.").classes("text-xs text-yellow-700")
+                                ui.label("No scheduled classes found for this lab.").classes("text-xs text-yellow-700 p-2")
 
                 lab_select.on_value_change(update_lab_view)
 
             # Room View Panel
             with ui.tab_panel(t4).classes("p-0"):
-                with ui.row().classes("items-center mb-2"):
+                with ui.row().classes("items-center mb-1"):
                     room_radio = ui.radio(CLASSES, value=CLASSES[0] if CLASSES else None).props("inline dense")
                 room_container = ui.element("div").classes("w-full")
 
@@ -786,7 +900,7 @@ def main_page():
                         if not mirror.empty:
                             render_table_grid(
                                 mirror,
-                                lambda r: f'{r["Class"]} | {r["Subject"]}',
+                                lambda r: f'{r["Class"]}\n{r["Subject"]}',
                                 target_cls=mirror_cls,
                             )
 
