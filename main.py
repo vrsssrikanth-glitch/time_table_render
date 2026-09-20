@@ -62,7 +62,7 @@ TABLE_TIMETABLE = "timetable"
 
 
 # ==================================================
-# HELPERS & DYNAMIC COLOR GENERATORS
+# HELPERS & COLOR GENERATORS
 # ==================================================
 def clean(x):
     if pd.isna(x):
@@ -70,13 +70,12 @@ def clean(x):
     return str(x).strip()
 
 
-def get_entity_color(entity_name):
+def get_entity_style(entity_name):
     """
-    Generates a consistent pastel color based on entity_name string CRC32 hash.
-    Works dynamically for both Subjects and Classes.
+    Generates inline CSS styling for subject/class cell cards.
     """
     if not entity_name or entity_name == "UNAVAILABLE":
-        return "background-color: #fee2e2; border-left: 4px solid #ef4444; color: #991b1b; font-weight: 600;"
+        return "background-color: #fee2e2; border-left: 4px solid #ef4444; color: #991b1b; padding: 4px 6px; border-radius: 4px; font-weight: 600;"
 
     clean_str = clean(entity_name).split("\n")[0].split("(")[0].strip().upper()
     
@@ -84,11 +83,11 @@ def get_entity_color(entity_name):
     hash_val = zlib.crc32(clean_str.encode("utf-8"))
     hue = hash_val % 360
 
-    bg_color = f"hsla({hue}, 70%, 92%, 0.9)"
-    border_color = f"hsl({hue}, 65%, 45%)"
-    text_color = f"hsl({hue}, 75%, 20%)"
+    bg_color = f"hsla({hue}, 75%, 93%, 0.95)"
+    border_color = f"hsl({hue}, 70%, 40%)"
+    text_color = f"hsl({hue}, 85%, 20%)"
 
-    return f"background-color: {bg_color}; border-left: 4px solid {border_color}; color: {text_color}; font-weight: 600;"
+    return f"background-color: {bg_color}; border-left: 4px solid {border_color}; color: {text_color}; padding: 4px 6px; border-radius: 4px; font-weight: 600;"
 
 
 def fetch_table(table_name):
@@ -305,7 +304,7 @@ TT_DATA = load_timetable()
 
 
 # ==================================================
-# CORE LOGIC FUNCTIONS
+# CORE LOGIC & METRICS
 # ==================================================
 def busy(key, val, day, p):
     key_alt = "class_id" if key == "Class" else "faculty_id" if key == "Faculty" else key.lower()
@@ -315,6 +314,45 @@ def busy(key, val, day, p):
         and int(r.get("Period", r.get("period", 0))) == int(p)
         for r in TT_DATA
     )
+
+
+def calculate_class_stats(cls):
+    """Calculates class work completion metrics for the given class."""
+    cls_col = next((c for c in teaching.columns if c.lower() == "class_id"), None)
+    sub_col = next((c for c in teaching.columns if c.lower() == "subject_id"), None)
+    hrs_col = next((c for c in teaching.columns if c.lower() == "hours"), None)
+
+    if not cls_col or not sub_col:
+        return 0, 0, []
+
+    cls_mask = teaching[cls_col].astype(str).str.strip().str.upper() == str(cls).strip().upper()
+    class_teaching_df = teaching[cls_mask]
+
+    total_target = 0
+    total_scheduled = 0
+    sub_progress = []
+
+    for _, row in class_teaching_df.iterrows():
+        s = clean(row[sub_col])
+        if not s:
+            continue
+        try:
+            target = int(row[hrs_col]) if hrs_col and pd.notna(row[hrs_col]) else 0
+        except (ValueError, TypeError):
+            target = 0
+
+        used = sum(
+            1
+            for r in TT_DATA
+            if clean(r.get("Class")).upper() == clean(cls).upper()
+            and clean(r.get("Subject")).upper() == clean(s).upper()
+        )
+
+        total_target += target
+        total_scheduled += used
+        sub_progress.append({"subject": s, "used": used, "target": target})
+
+    return total_scheduled, total_target, sub_progress
 
 
 def is_bi_lab_pair(sub1, sub2):
@@ -435,7 +473,7 @@ def add_entry(cls, sub, day, start, override_fac=None):
 
 
 # ==================================================
-# EXCEL GENERATION
+# EXCEL EXPORT
 # ==================================================
 def grid(data, label):
     g = pd.DataFrame("", index=DAYS, columns=PERIODS)
@@ -479,20 +517,20 @@ def create_excel():
 
 
 # ==================================================
-# MAIN NICEGUI INTERFACE BUILDER
+# MAIN APPLICATION INTERFACE
 # ==================================================
 @ui.page("/")
 def main_page():
     ui.add_head_html("""
         <style>
             .q-page { padding: 8px !important; }
-            .dense-card { padding: 12px !important; }
-            .q-table--dense td, .q-table--dense th { padding: 6px 8px !important; height: auto !important; }
-            .sub-cell-badge { border-radius: 4px; padding: 4px 6px; font-size: 11px; display: block; width: 100%; text-align: center; white-space: pre-line; line-height: 1.2; }
+            .dense-card { padding: 10px !important; }
+            .q-table--dense td, .q-table--dense th { padding: 4px 6px !important; height: auto !important; }
+            .cell-box { width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; font-size: 11px; white-space: pre-line; line-height: 1.2; min-height: 42px; }
         </style>
     """)
 
-    # Full-width Header Toolbar
+    # Top Header Toolbar
     with ui.row().classes("w-full items-center justify-between mb-2 bg-white p-3 rounded shadow-xs border"):
         with ui.row().classes("items-center gap-2"):
             ui.icon("calendar_month", size="28px", color="primary")
@@ -513,21 +551,20 @@ def main_page():
             ui.button("Refresh", icon="refresh", on_click=refresh_grid).props("dense outline")
             ui.button("Export Excel", icon="download", on_click=download_excel).props("dense color=green")
 
-    # Reusable Grid Renderer supporting Subject or Class color-coding
+    # Table renderer that renders custom HTML elements in Quasar table body
     def render_table_grid(data_df, formatter_fn, is_faculty=False, faculty_id="", target_cls=None, color_entity_key="Subject"):
-        columns = [{"name": "Day", "label": "Day", "field": "Day", "align": "left"}]
+        columns = [{"name": "Day", "label": "Day", "field": "Day", "align": "left", "sortable": False}]
         for p in PERIODS:
-            columns.append({"name": f"P{p}", "label": f"P{p}", "field": f"P{p}", "align": "center"})
+            columns.append({"name": f"P{p}", "label": f"P{p}", "field": f"P{p}", "align": "center", "sortable": False})
 
         rows = []
-        color_styles = {}
 
         for day in DAYS:
             row_dict = {"Day": day}
             for p in PERIODS:
                 if is_faculty and (faculty_id.upper(), day, p) in FAC_BLOCKED:
-                    row_dict[f"P{p}"] = "UNAVAILABLE"
-                    color_styles[f"{day}_P{p}"] = get_entity_color("UNAVAILABLE")
+                    style = get_entity_style("UNAVAILABLE")
+                    row_dict[f"P{p}"] = f'<div style="{style}" class="cell-box">UNAVAILABLE</div>'
                 else:
                     row_dict[f"P{p}"] = ""
             rows.append(row_dict)
@@ -536,38 +573,28 @@ def main_page():
             for _, r in data_df.iterrows():
                 d = r.get("Day")
                 p = int(r.get("Period", 0))
-                
-                # Determine entity to colorize (Subject in Class View, Class in Faculty View)
                 entity_value = r.get(color_entity_key, "")
 
                 if d in DAYS and p in PERIODS:
                     val = formatter_fn(r)
+                    style = get_entity_style(entity_value)
+                    formatted_html = f'<div style="{style}" class="cell-box">{val}</div>'
+                    
                     for row in rows:
                         if row["Day"] == d:
-                            row[f"P{p}"] = val
-                            color_styles[f"{d}_P{p}"] = get_entity_color(entity_value)
+                            row[f"P{p}"] = formatted_html
 
         table = ui.table(columns=columns, rows=rows, row_key="Day").props("dense flat bordered").classes("w-full")
 
-        # Vue Custom Slot for dynamic dynamic styling
+        # HTML slot injection for rendering colors inside table cells
         table.add_slot(
             "body-cell",
             r"""
-            <q-td :props="props" 
-                  :style="props.row[props.col.name + '_style'] || ''"
-                  :class="props.value ? 'hover:opacity-80 cursor-pointer transition-all' : ''"
-                  @click="props.value && props.value !== 'UNAVAILABLE' && $parent.$emit('cell-click', {day: props.row.Day, col: props.col.name})">
-                <span class="sub-cell-badge">{{ props.value }}</span>
+            <q-td :props="props" @click="$parent.$emit('cell-click', {day: props.row.Day, col: props.col.name})">
+                <div v-html="props.value"></div>
             </q-td>
             """,
         )
-
-        for row in rows:
-            day = row["Day"]
-            for p in PERIODS:
-                col_key = f"P{p}"
-                style_key = f"{day}_{col_key}"
-                row[f"{col_key}_style"] = color_styles.get(style_key, "")
 
         def on_cell_click(e):
             day = e.args.get("day")
@@ -578,11 +605,11 @@ def main_page():
                     del_cls.set_value(target_cls)
                 del_day.set_value(day)
                 del_per.set_value(p_num)
-                ui.notify(f"Selected {day} P{p_num} for deletion.", type="info")
+                ui.notify(f"Selected {day} Period {p_num} for entry deletion.", type="info")
 
         table.on("cell-click", on_cell_click)
 
-    # Global View Updates
+    # Refresh triggers
     def refresh_views():
         update_class_view()
         update_faculty_view()
@@ -636,7 +663,7 @@ def main_page():
         ]
 
         if not matching:
-            ui.notify("No timetable entry found for given parameters.", type="warning")
+            ui.notify("No entry found to delete.", type="warning")
         elif delete_timetable_entry(dcls, dday, dper):
             TT_DATA = [
                 r for r in TT_DATA
@@ -650,7 +677,7 @@ def main_page():
             refresh_views()
 
     # ==================================================
-    # FULL-WIDTH TOP ACTION SECTION (Eliminating empty right space)
+    # TOP SECTION: ADD AND DELETE FORMS
     # ==================================================
     with ui.row().classes("w-full gap-3 mb-2 items-stretch"):
         # Add Entry Card - Spans 8 Columns
@@ -714,7 +741,7 @@ def main_page():
                 ui.button("DELETE ENTRY", icon="delete", on_click=handle_delete).props("dense color=negative").classes("w-full")
 
     # ==================================================
-    # BOTTOM MAIN VIEW TABS
+    # MAIN VIEWS (CLASS, FACULTY, LAB, ROOM)
     # ==================================================
     with ui.card().classes("w-full dense-card shadow-sm border border-gray-200"):
         with ui.tabs().classes("w-full dense text-primary") as tabs:
@@ -724,27 +751,54 @@ def main_page():
             t4 = ui.tab("🏫 Room View")
 
         with ui.tab_panels(tabs, value=t1).classes("w-full p-1"):
-            # 1. CLASS VIEW (Color Code by Subject)
+            # 1. CLASS VIEW WITH PROGRESS MONITOR
             with ui.tab_panel(t1).classes("p-0"):
-                with ui.row().classes("items-center mb-2"):
+                with ui.row().classes("items-center justify-between mb-2 w-full"):
                     cv_select = ui.select(options=CLASSES, label="Select Class", value=CLASSES[0] if CLASSES else None).props("dense outlined").classes("w-56")
+                    progress_info_container = ui.row().classes("items-center gap-2")
+
+                class_progress_bar_container = ui.column().classes("w-full mb-2")
                 class_container = ui.element("div").classes("w-full")
 
                 def update_class_view():
                     class_container.clear()
+                    progress_info_container.clear()
+                    class_progress_bar_container.clear()
+
+                    cls = cv_select.value
                     df = pd.DataFrame(TT_DATA)
-                    cdf = df[df["Class"].astype(str).str.strip().str.upper() == str(cv_select.value).strip().upper()] if "Class" in df.columns and not df.empty else pd.DataFrame()
+                    cdf = df[df["Class"].astype(str).str.strip().str.upper() == str(cls).strip().upper()] if "Class" in df.columns and not df.empty else pd.DataFrame()
+
+                    # Render Class Work Load Progress Tracker
+                    sched, target, sub_progress = calculate_class_stats(cls)
+                    percent = (sched / target * 100) if target > 0 else 0.0
+
+                    with class_progress_bar_container:
+                        with ui.row().classes("w-full justify-between items-center mb-1"):
+                            ui.label(f"📊 {cls} Class Work Completion: {sched} / {target} Total Hours").classes("text-xs font-bold text-gray-700")
+                            ui.label(f"{percent:.1f}% Scheduled").classes("text-xs font-bold text-blue-700")
+                        
+                        ui.linear_progress(value=percent / 100.0, show_value=False).props("stripe rounded size=8px color=primary")
+
+                        with ui.row().classes("w-full gap-1 mt-1 wrap"):
+                            for sp in sub_progress:
+                                is_done = sp["used"] >= sp["target"] and sp["target"] > 0
+                                bg = "bg-green-100 text-green-800 border-green-300" if is_done else "bg-amber-50 text-amber-900 border-amber-200"
+                                with ui.card().classes(f"p-1 border text-xs {bg} shadow-2xs"):
+                                    ui.label(f"{sp['subject']}: {sp['used']}/{sp['target']} hrs").classes("font-mono text-xs")
+
+                    # Render Grid Table with Subject Color Coding
                     with class_container:
                         render_table_grid(
                             cdf,
                             lambda r: f'{r["Subject"]}\n({FAC_NAME.get(clean(r["Faculty"]).upper(), r["Faculty"])})',
-                            target_cls=cv_select.value,
-                            color_entity_key="Subject",  # Color code by Subject
+                            target_cls=cls,
+                            color_entity_key="Subject",  # Subject color coding
                         )
 
                 cv_select.on_value_change(update_class_view)
 
-            # 2. FACULTY VIEW (Color Code by Class & Auto-Search Faculty Name)
+            # 2. FACULTY VIEW (Color Code by Class)
             with ui.tab_panel(t2).classes("p-0"):
                 fac_name_to_id = {v: k for k, v in FAC_NAME.items()}
                 sorted_fac_names = sorted(list(fac_name_to_id.keys()))
@@ -772,7 +826,7 @@ def main_page():
                                 lambda r: f'{r["Class"]}\n[{r["Subject"]}]',
                                 is_faculty=True,
                                 faculty_id=fid,
-                                color_entity_key="Class",  # Color code by Class
+                                color_entity_key="Class",  # Class color coding
                             )
 
                 fv_select.on_value_change(update_faculty_view)
@@ -840,7 +894,7 @@ def main_page():
 
                 room_radio.on_value_change(update_room_view)
 
-    # Initial View Trigger
+    # Initial view load
     if CLASSES:
         update_subjects_dropdown(CLASSES[0])
     refresh_views()
