@@ -569,7 +569,7 @@ def main_page():
             refresh_views()
 
     def handle_delete():
-        global TT_DATA  # <-- Placed at top of function scope to avoid SyntaxError
+        global TT_DATA
         dcls = del_cls.value
         dday = del_day.value
         dper = del_per.value
@@ -645,7 +645,7 @@ def main_page():
         # Class View Panel
         with ui.tab_panel(t1):
             cv_select = ui.select(options=CLASSES, label="Class", value=CLASSES[0] if CLASSES else None)
-            class_container = ui.container().classes("w-full mt-4")
+            class_container = ui.element("div").classes("w-full mt-4")
 
             def update_class_view():
                 class_container.clear()
@@ -663,7 +663,7 @@ def main_page():
         with ui.tab_panel(t2):
             sorted_fac_names = sorted(list(set(str(v) for v in FAC_NAME.values() if v)))
             fv_select = ui.select(options=sorted_fac_names, label="Faculty", value=sorted_fac_names[0] if sorted_fac_names else None)
-            fac_container = ui.container().classes("w-full mt-4")
+            fac_container = ui.element("div").classes("w-full mt-4")
 
             def update_faculty_view():
                 fac_container.clear()
@@ -682,7 +682,7 @@ def main_page():
         with ui.tab_panel(t3):
             lab_list = sorted(labs_df["Lab_Subject"].dropna().unique()) if "Lab_Subject" in labs_df.columns else []
             lab_select = ui.select(options=lab_list, label="Lab", value=lab_list[0] if lab_list else None)
-            lab_container = ui.container().classes("w-full mt-4")
+            lab_container = ui.element("div").classes("w-full mt-4")
 
             def update_lab_view():
                 lab_container.clear()
@@ -712,7 +712,7 @@ def main_page():
         with ui.tab_panel(t4):
             ui.label("Theory Room Planning").classes("text-lg font-bold")
             room_radio = ui.radio(CLASSES, value=CLASSES[0] if CLASSES else None).props("inline")
-            room_container = ui.container().classes("w-full mt-4")
+            room_container = ui.element("div").classes("w-full mt-4")
 
             def update_room_view():
                 room_container.clear()
@@ -766,3 +766,4 @@ def main_page():
 if __name__ in {"__main__", "__mp_main__"}:
     port = int(os.environ.get("PORT", 8080))
     ui.run(host="0.0.0.0", port=port, title="Timetable Generative System")
+    
