@@ -569,6 +569,7 @@ def main_page():
             refresh_views()
 
     def handle_delete():
+        global TT_DATA  # <-- Placed at top of function scope to avoid SyntaxError
         dcls = del_cls.value
         dday = del_day.value
         dper = del_per.value
@@ -583,7 +584,6 @@ def main_page():
         if not matching:
             ui.notify("No timetable entry found.", type="warning")
         elif delete_timetable_entry(dcls, dday, dper):
-            global TT_DATA
             TT_DATA = [
                 r for r in TT_DATA
                 if not (
